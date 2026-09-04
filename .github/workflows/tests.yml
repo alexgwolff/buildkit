@@ -1,0 +1,139 @@
+# Runs the integration suite natively on both architectures, one worker per job.
+#
+# Exists to answer "is this failure specific to arm64?" in a single dispatch. The
+# arm64 and amd64 jobs share everything that could otherwise explain a difference:
+# same commit, same test image, same hack/test invocation, same inputs. So a test
+# that fails on one runner and passes on the other differs by architecture and
+# nothing else.
+#
+# It also removes two variables present when running the suite on an arm64 macOS
+# host: Docker Desktop's nested VM, and the contention of nine workers sharing one
+# machine. Here the tests run in containers directly on the runner's kernel, and
+# each worker gets its own runner.
+#
+# Fork-only: not intended to be sent upstream.
+name: tests
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'Test kind passed to hack/test'
+        required: true
+        default: 'integration'
+        type: choice
+        options:
+          - integration
+          - dockerfile
+          - gateway
+      pkg:
+        description: 'Go package under test (TESTPKGS)'
+        required: false
+        default: './client'
+        type: string
+      tests:
+        description: 'Test name filter, e.g. TestStargzLazy (empty runs all)'
+        required: false
+        default: ''
+        type: string
+      runners:
+        description: 'JSON array of runners to compare'
+        required: false
+        default: '["ubuntu-24.04-arm","ubuntu-24.04"]'
+        type: string
+      workers:
+        description: 'JSON array of buildkit workers'
+        required: false
+        default: '["containerd","containerd-rootless","containerd-1.7","containerd-2.2","containerd-snapshotter-stargz","oci","oci-rootless","oci-rootless-gvisor-tap-vsock-detachnetns","oci-snapshotter-stargz"]'
+        type: string
+      timeout:
+        description: 'Go test timeout'
+        required: false
+        default: '45m'
+        type: string
+
+env:
+  SETUP_BUILDX_VERSION: "edge"
+  SETUP_BUILDKIT_IMAGE: "moby/buildkit:latest"
+
+jobs:
+  run:
+    runs-on: ${{ matrix.runner }}
+    env:
+      GOTESTSUM_FORMAT: "standard-verbose"
+      TEST_IMAGE_BUILD: "0"
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runners) }}
+        worker: ${{ fromJSON(inputs.workers) }}
+    steps:
+      -
+        name: Prepare
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+          WORKER: ${{ matrix.worker }}
+          TESTS: ${{ inputs.tests }}
+          TIMEOUT: ${{ inputs.timeout }}
+        run: |
+          echo "TEST_REPORT_SUFFIX=-${RUNNER_LABEL}-${WORKER}" >> $GITHUB_ENV
+          echo "TESTFLAGS=-v --parallel=6 --timeout=${TIMEOUT} --run=/${TESTS}/worker=${WORKER}\$" >> $GITHUB_ENV
+      -
+        name: Show runner platform
+        run: |
+          uname -m
+          nproc
+          free -g || true
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      -
+        name: Expose GitHub Runtime
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+      -
+        # Registers binfmt_misc handlers on the runner. Not for speed: without them
+        # archutil's probe cannot exec the foreign-arch check binary, the worker stops
+        # advertising that platform, and buildkit then injects a qemu emulator
+        # (solver/llbsolver/ops/exec.go) in front of a rootfs that is already the
+        # host's architecture, because mirrored test images are single-arch.
+        name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: ${{ env.SETUP_BUILDX_VERSION }}
+          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
+          buildkitd-flags: --debug
+      -
+        # Cache scope is per runner: the test image is native to each architecture,
+        # so a shared scope would have the two sides evicting each other.
+        name: Build test image
+        uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
+        with:
+          targets: integration-tests
+          set: |
+            *.cache-from=type=gha,scope=tests-${{ matrix.runner }}
+            *.cache-to=type=gha,scope=tests-${{ matrix.runner }},repository=${{ github.repository }},ghtoken=${{ github.token }}
+      -
+        name: Test
+        run: |
+          ./hack/test ${KIND}
+        env:
+          KIND: ${{ inputs.kind }}
+          TESTPKGS: ${{ inputs.pkg }}
+      -
+        name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: testreports-${{ matrix.runner }}-${{ matrix.worker }}
+          path: ./bin/testreports/*
+          if-no-files-found: warn
