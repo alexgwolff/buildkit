@@ -2772,7 +2772,7 @@ COPY --from=base /out /
 	}, nil)
 	require.NoError(t, err)
 
-	expPlatform := strings.ReplaceAll(platforms.FormatAll(platforms.DefaultSpec()), "/", "_")
+	expPlatform := strings.ReplaceAll(platforms.FormatAll(platforms.Normalize(platforms.DefaultSpec())), "/", "_")
 
 	dt, err := os.ReadFile(filepath.Join(destDir, expPlatform, "foo"))
 	require.NoError(t, err)
