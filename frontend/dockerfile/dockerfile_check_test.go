@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/containerd/continuity/fs/fstest"
+	"github.com/containerd/platforms"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/frontend/dockerfile/linter"
 	"github.com/moby/buildkit/frontend/dockerui"
@@ -1687,6 +1688,17 @@ func checkUnmarshal(t *testing.T, sb integration.Sandbox, lintTest *lintTestPara
 	require.True(t, called)
 }
 
+// multiPlatformByHost maps a host platform to the value of the "platform" frontend
+// attribute to build with on that host.
+//
+// Only pairs known to build are listed. That a host can build for amd64 and arm64 is
+// no evidence that, say, ppc64le can build for s390x, so an unlisted host skips
+// rather than guesses.
+var multiPlatformByHost = map[string]string{
+	"linux/amd64": "linux/amd64,linux/arm64",
+	"linux/arm64": "linux/arm64,linux/amd64",
+}
+
 func checkProgressStream(t *testing.T, sb integration.Sandbox, lintTest *lintTestParams) {
 	t.Helper()
 
@@ -1713,10 +1725,17 @@ func checkProgressStream(t *testing.T, sb integration.Sandbox, lintTest *lintTes
 
 	f := getFrontend(t, sb)
 
+	hostPlatform := platforms.Format(platforms.Normalize(platforms.DefaultSpec()))
+
 	platformStr := integration.UnixOrWindows(
-		"linux/amd64,linux/arm64",
+		multiPlatformByHost[hostPlatform],
 		"windows/amd64",
 	)
+
+	if platformStr == "" {
+		t.Skipf("no known multi-platform pair for host platform %s", hostPlatform)
+	}
+
 	attrs := lintTest.FrontendAttrs
 	if attrs == nil {
 		attrs = map[string]string{
