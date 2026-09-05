@@ -1,15 +1,17 @@
 # Runs the integration suite natively on both architectures, one worker per job.
 #
-# Exists to answer "is this failure specific to arm64?" in a single dispatch. The
-# arm64 and amd64 jobs share everything that could otherwise explain a difference:
-# same commit, same test image, same hack/test invocation, same inputs. So a test
-# that fails on one runner and passes on the other differs by architecture and
-# nothing else.
+# Exists to answer "is this failure specific to arm64?" in a single run. The arm64
+# and amd64 jobs share everything that could otherwise explain a difference: same
+# commit, same test image, same hack/test invocation. So a test that fails on one
+# and passes on the other differs by architecture and nothing else.
 #
 # It also removes two variables present when running the suite on an arm64 macOS
-# host: Docker Desktop's nested VM, and the contention of nine workers sharing one
-# machine. Here the tests run in containers directly on the runner's kernel, and
-# each worker gets its own runner.
+# host: Docker Desktop's nested VM, and nine workers contending for one machine.
+# Here the tests run in containers directly on the runner's kernel, and each
+# worker gets a runner to itself.
+#
+# On a pull request the full matrix runs, covering the same packages and kinds
+# that buildkit.yml and frontend.yml cover upstream. workflow_dispatch narrows it.
 #
 # Fork-only: not intended to be sent upstream.
 name: tests
@@ -22,36 +24,51 @@ permissions:
   contents: read
 
 on:
+  pull_request:
   workflow_dispatch:
     inputs:
-      kind:
-        description: 'Test kind passed to hack/test'
+      platforms:
+        description: 'Architecture to run on'
         required: true
-        default: 'integration'
+        default: 'both'
         type: choice
         options:
-          - integration
+          - both
+          - arm64
+          - amd64
+      worker:
+        description: 'buildkit worker'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - containerd
+          - containerd-rootless
+          - containerd-1.7
+          - containerd-2.2
+          - containerd-snapshotter-stargz
+          - oci
+          - oci-rootless
+          - oci-rootless-gvisor-tap-vsock-detachnetns
+          - oci-snapshotter-stargz
+      suite:
+        description: 'Package/kind set'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - client
           - dockerfile
-          - gateway
-      pkg:
-        description: 'Go package under test (TESTPKGS)'
-        required: false
-        default: './client'
-        type: string
+          - solver
+          - frontend
+          - buildctl
+          - containerd-worker
       tests:
         description: 'Test name filter, e.g. TestStargzLazy (empty runs all)'
         required: false
         default: ''
-        type: string
-      runners:
-        description: 'JSON array of runners to compare'
-        required: false
-        default: '["ubuntu-24.04-arm","ubuntu-24.04"]'
-        type: string
-      workers:
-        description: 'JSON array of buildkit workers'
-        required: false
-        default: '["containerd","containerd-rootless","containerd-1.7","containerd-2.2","containerd-snapshotter-stargz","oci","oci-rootless","oci-rootless-gvisor-tap-vsock-detachnetns","oci-snapshotter-stargz"]'
         type: string
       timeout:
         description: 'Go test timeout'
@@ -64,33 +81,109 @@ env:
   SETUP_BUILDKIT_IMAGE: "moby/buildkit:latest"
 
 jobs:
+  prepare:
+    # Never run if these files end up in a pull request against upstream.
+    if: ${{ github.repository != 'moby/buildkit' }}
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      -
+        # The matrix is built here rather than in `strategy`, so a bad value
+        # fails in a step with a readable log instead of during strategy
+        # evaluation, which produces no job, no log and only a YAML line number.
+        name: Build matrix
+        id: set
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_PLATFORMS: ${{ inputs.platforms }}
+          IN_WORKER: ${{ inputs.worker }}
+          IN_SUITE: ${{ inputs.suite }}
+        run: |
+          set -euo pipefail
+
+          allWorkers='["containerd","containerd-rootless","containerd-1.7","containerd-2.2","containerd-snapshotter-stargz","oci","oci-rootless","oci-rootless-gvisor-tap-vsock-detachnetns","oci-snapshotter-stargz"]'
+
+          # Package/kind sets, mirroring what upstream covers: buildkit.yml passes
+          # these packages with kind=integration, frontend.yml adds
+          # ./frontend/dockerfile with both integration and dockerfile.
+          allSuites='[
+            {"name":"client","pkg":"./client","kind":"integration"},
+            {"name":"buildctl","pkg":"./cmd/buildctl","kind":"integration"},
+            {"name":"containerd-worker","pkg":"./worker/containerd","kind":"integration"},
+            {"name":"solver","pkg":"./solver","kind":"integration"},
+            {"name":"frontend","pkg":"./frontend","kind":"integration"},
+            {"name":"dockerfile","pkg":"./frontend/dockerfile","kind":"integration"},
+            {"name":"dockerfile","pkg":"./frontend/dockerfile","kind":"dockerfile"}
+          ]'
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            case "$IN_PLATFORMS" in
+              arm64) platforms='["linux/arm64"]' ;;
+              amd64) platforms='["linux/amd64"]' ;;
+              *)     platforms='["linux/amd64","linux/arm64"]' ;;
+            esac
+            if [ "$IN_WORKER" = "all" ]; then
+              workers="$allWorkers"
+            else
+              workers=$(jq -c -n --arg w "$IN_WORKER" '[$w]')
+            fi
+            if [ "$IN_SUITE" = "all" ]; then
+              suites="$allSuites"
+            else
+              suites=$(jq -c --arg s "$IN_SUITE" '[.[] | select(.name == $s)]' <<<"$allSuites")
+            fi
+          else
+            platforms='["linux/amd64","linux/arm64"]'
+            workers="$allWorkers"
+            suites="$allSuites"
+          fi
+
+          matrix=$(jq -c -n \
+            --argjson p "$platforms" --argjson w "$workers" --argjson s "$suites" \
+            '[ $p[] as $pl | $s[] as $st | $w[] as $wk
+               | {platform:$pl, worker:$wk, pkg:$st.pkg, kind:$st.kind} ]')
+
+          count=$(jq length <<<"$matrix")
+          if [ "$count" -eq 0 ]; then
+            echo "::error::empty matrix for platforms=$IN_PLATFORMS worker=$IN_WORKER suite=$IN_SUITE"
+            exit 1
+          fi
+          echo "$count jobs"
+          jq . <<<"$matrix"
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
   run:
-    runs-on: ${{ matrix.runner }}
+    needs:
+      - prepare
+    # Same idiom test-os.yml uses for its arm64 jobs.
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     env:
       GOTESTSUM_FORMAT: "standard-verbose"
       TEST_IMAGE_BUILD: "0"
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.runners) }}
-        worker: ${{ fromJSON(inputs.workers) }}
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       -
         name: Prepare
         env:
-          RUNNER_LABEL: ${{ matrix.runner }}
+          PLATFORM: ${{ matrix.platform }}
           WORKER: ${{ matrix.worker }}
+          PKG: ${{ matrix.pkg }}
+          KIND: ${{ matrix.kind }}
           TESTS: ${{ inputs.tests }}
-          TIMEOUT: ${{ inputs.timeout }}
+          TIMEOUT: ${{ inputs.timeout || '45m' }}
         run: |
-          echo "TEST_REPORT_SUFFIX=-${RUNNER_LABEL}-${WORKER}" >> $GITHUB_ENV
+          slug=$(echo "${PLATFORM}-${PKG}-${KIND}-${WORKER}" | tr -dc '[:alnum:]-' | tr '[:upper:]' '[:lower:]')
+          echo "TEST_REPORT_SUFFIX=-${slug}" >> $GITHUB_ENV
           echo "TESTFLAGS=-v --parallel=6 --timeout=${TIMEOUT} --run=/${TESTS}/worker=${WORKER}\$" >> $GITHUB_ENV
       -
         name: Show runner platform
         run: |
           uname -m
           nproc
-          free -g || true
       -
         name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -113,27 +206,28 @@ jobs:
           driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
           buildkitd-flags: --debug
       -
-        # Cache scope is per runner: the test image is native to each architecture,
-        # so a shared scope would have the two sides evicting each other.
+        # Cache scope is per platform: the test image is native to each
+        # architecture, so a shared scope would have the two sides evicting
+        # each other.
         name: Build test image
         uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
         with:
           targets: integration-tests
           set: |
-            *.cache-from=type=gha,scope=tests-${{ matrix.runner }}
-            *.cache-to=type=gha,scope=tests-${{ matrix.runner }},repository=${{ github.repository }},ghtoken=${{ github.token }}
+            *.cache-from=type=gha,scope=tests-${{ matrix.platform }}
+            *.cache-to=type=gha,scope=tests-${{ matrix.platform }},repository=${{ github.repository }},ghtoken=${{ github.token }}
       -
         name: Test
         run: |
           ./hack/test ${KIND}
         env:
-          KIND: ${{ inputs.kind }}
-          TESTPKGS: ${{ inputs.pkg }}
+          KIND: ${{ matrix.kind }}
+          TESTPKGS: ${{ matrix.pkg }}
       -
         name: Upload test reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: testreports-${{ matrix.runner }}-${{ matrix.worker }}
+          name: testreports${{ env.TEST_REPORT_SUFFIX }}
           path: ./bin/testreports/*
           if-no-files-found: warn
